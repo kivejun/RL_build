@@ -1,0 +1,18 @@
+# 忽略编译产物
+build/
+devel/
+logs/
+.catkin_workspace
+
+# 忽略 IDE 配置文件
+.vscode/
+.idea/
+
+# 忽略巨大的 SLAM 词典文件 (GitHub 单文件限制 100MB)
+*.txt
+*.bin
+
+# 忽略编译生成的二进制程序 (如 Mono, Stereo)
+src/ORB_SLAM3/Examples/ROS/ORB_SLAM3/Mono
+src/ORB_SLAM3/Examples/ROS/ORB_SLAM3/Stereo
+src/ORB_SLAM3/Examples/ROS/ORB_SLAM3/Stereo_Inertial
