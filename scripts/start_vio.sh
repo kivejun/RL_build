@@ -1,28 +1,38 @@
 #!/bin/bash
 
-# 设置窗口标题
-TITLE="XTDrone VINS-Fusion One-Click Start"
+# 1. 设置路径变量 (请确保这是你电脑上的真实路径)
+FIRMWARE_DIR="/home/kivejun/PX4_Firmware"
 
-# 1. 启动 PX4 仿真环境 (在第一个标签页)
-gnome-terminal --window --title="$TITLE" -- bash -c "roslaunch px4 indoor5.launch; exec bash"
+# 2. 构建完整的 ROS_PACKAGE_PATH
+# 我们需要包含 Firmware 本身，以及它的 Tools/sitl_gazebo 目录
+PX4_PACKAGES="$FIRMWARE_DIR:$FIRMWARE_DIR/Tools/sitl_gazebo"
 
-# 等待几秒确保 PX4 启动完毕（根据电脑性能调整）
-sleep 8
+# 3. 启动 PX4 仿真环境
+gnome-terminal --window --title="PX4 SITL" -- bash -c "\
+source ~/.bashrc; \
+export ROS_PACKAGE_PATH=\$ROS_PACKAGE_PATH:$PX4_PACKAGES; \
+roslaunch px4 indoor5.launch; \
+exec bash"
 
-# 2. 运行 VIO 脚本
-gnome-terminal --tab --title="VIO Script" -- bash -c "cd ~/catkin_ws && bash scripts/xtdrone_run_vio.sh; exec bash"
+# 等待仿真环境完全加载
+sleep 10
+
+# 4. 运行 VIO 脚本
+gnome-terminal --tab --title="VIO Script" -- bash -c "source ~/.bashrc; cd ~/catkin_ws && bash scripts/xtdrone_run_vio.sh; exec bash"
 
 sleep 3
 
-# 3. 运行 VINS 坐标转换
-gnome-terminal --tab --title="VINS Transfer" -- bash -c "cd ~/XTDrone/sensing/slam/vio && python vins_transfer.py iris 0; exec bash"
+# 5. 运行 VINS 坐标转换
+gnome-terminal --tab --title="VINS Transfer" -- bash -c "source ~/.bashrc; cd ~/XTDrone/sensing/slam/vio && python vins_transfer.py iris 0; exec bash"
 
 sleep 3
-# 4. 运行多旋翼通信脚本
-gnome-terminal --tab --title="Communication" -- bash -c "cd ~/XTDrone/communication && python multirotor_communication.py iris 0; exec bash"
+
+# 6. 运行多旋翼通信脚本
+gnome-terminal --tab --title="Communication" -- bash -c "source ~/.bashrc; cd ~/XTDrone/communication && python multirotor_communication.py iris 0; exec bash"
 
 sleep 3
-# 5. 运行键盘控制 (通常放在最后，方便直接操作)
-gnome-terminal --tab --title="Keyboard Control" -- bash -c "cd ~/XTDrone/control/keyboard && python multirotor_keyboard_control.py iris 1 vel; exec bash"
 
-echo "VINS-Fusion 仿真环境已尝试全面启动。"
+# 7. 运行采集脚本
+gnome-terminal --tab --title="DATA_COLLECTOR" -- bash -c "source ~/.bashrc; cd ~/catkin_ws/src/rl_data_collector/scripts && python3 expert_collector.py; exec bash"
+
+echo "VINS-Fusion 环境及采集脚本已全面启动。"
