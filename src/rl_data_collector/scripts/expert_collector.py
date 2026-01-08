@@ -6,154 +6,164 @@ import math
 import csv
 import os
 import time
-from geometry_msgs.msg import Twist, PoseStamped
+import threading
+from geometry_msgs.msg import Twist, PoseStamped, Pose
 from mavros_msgs.msg import State
-from mavros_msgs.srv import CommandBool, SetMode
+from std_msgs.msg import String
 from tf.transformations import euler_from_quaternion
 
-class AerobaticAutoLoop:
+class GPSAerobaticCollectorV7:
     def __init__(self):
-        rospy.init_node('aerobatic_auto_loop')
+        rospy.init_node('expert_collector_node')
         
-        self.ns = "/iris_0"
-        self.target_alt = 1.0  # 目标高度 1.0 米
+        # 命名空间配置
+        self.uav_id = "iris_0"
+        self.xtdrone_ns = "/xtdrone/" + self.uav_id
+        self.mavros_ns = "/" + self.uav_id
+        
+        self.target_alt = 2.3
+        self.is_collecting = False 
 
-        # --- 1. 话题发布者 ---
-        self.pos_pub = rospy.Publisher(self.ns + "/mavros/setpoint_position/local", PoseStamped, queue_size=10)
-        self.vel_pub = rospy.Publisher(self.ns + "/mavros/setpoint_velocity/cmd_vel_unstamped", Twist, queue_size=10)
+        # --- 发布者 ---
+        self.pos_pub = rospy.Publisher(self.xtdrone_ns + "/cmd_pose_enu", Pose, queue_size=10)
+        self.vel_pub = rospy.Publisher(self.xtdrone_ns + "/cmd_vel_flu", Twist, queue_size=10)
+        self.cmd_pub = rospy.Publisher(self.xtdrone_ns + "/cmd", String, queue_size=10)
         
-        # --- 2. 状态订阅 ---
+        # --- 状态订阅 ---
         self.current_state = State()
         self.current_pose = PoseStamped()
-        rospy.Subscriber(self.ns + "/mavros/state", State, self.state_cb)
-        rospy.Subscriber(self.ns + "/mavros/local_position/pose", PoseStamped, self.pose_cb)
-        
-        self.arming_client = rospy.ServiceProxy(self.ns + '/mavros/cmd/arming', CommandBool)
-        self.set_mode_client = rospy.ServiceProxy(self.ns + '/mavros/set_mode', SetMode)
+        rospy.Subscriber(self.mavros_ns + "/mavros/state", State, self.state_cb)
+        rospy.Subscriber(self.mavros_ns + "/mavros/local_position/pose", PoseStamped, self.pose_cb)
         
         self.rate = rospy.Rate(30)
+        self.prev_z_err = 0
+
+        # 数据保存路径
+        self.save_path = os.path.expanduser("~/flight_dataset")
+        if not os.path.exists(self.save_path):
+            os.makedirs(self.save_path)
+            rospy.loginfo(f"创建数据集目录: {self.save_path}")
+
+        # 后台心跳线程
+        self.heartbeat_thread = threading.Thread(target=self.maintain_hover_audit)
+        self.heartbeat_thread.daemon = True
+        self.heartbeat_thread.start()
 
     def state_cb(self, msg): self.current_state = msg
     def pose_cb(self, msg): self.current_pose = msg
 
-    def return_to_origin(self):
-        """执行返航逻辑：飞回 (0,0,1)"""
-        rospy.loginfo(">>> 正在飞回原点 (0,0,1)...")
-        target = PoseStamped()
-        target.pose.position.x = 0
-        target.pose.position.y = 0
-        target.pose.position.z = self.target_alt
-        
+    def maintain_hover_audit(self):
+        hover_rate = rospy.Rate(30)
         while not rospy.is_shutdown():
-            # 计算距离原点的水平距离
-            dist = math.sqrt(self.current_pose.pose.position.x**2 + self.current_pose.pose.position.y**2)
-            if dist < 0.2: # 如果距离原点小于 20 厘米，认为到达
-                rospy.loginfo(">>> 已到达原点附近，准备下一次任务。")
-                # 停留 1 秒稳一稳
-                for _ in range(30):
-                    self.pos_pub.publish(target)
-                    self.rate.sleep()
-                break
-            
-            self.pos_pub.publish(target)
-            self.rate.sleep()
+            if not self.is_collecting and self.current_state.armed:
+                target = Pose()
+                target.position.x = 0
+                target.position.y = 0
+                target.position.z = self.target_alt
+                self.pos_pub.publish(target)
+            hover_rate.sleep()
 
     def run(self):
-        # 初始连接
+        # 1. 等待连接
         while not rospy.is_shutdown() and not self.current_state.connected:
-            rospy.loginfo("等待 FCU 连接...")
+            rospy.loginfo("等待 MAVROS 与 FCU 连接...")
             self.rate.sleep()
 
-        # --- 初始起飞阶段 ---
-        rospy.loginfo("发送初始位姿并尝试起飞...")
-        takeoff_pose = PoseStamped()
-        takeoff_pose.pose.position.z = self.target_alt
-        
-        for _ in range(100): self.pos_pub.publish(takeoff_pose); self.rate.sleep()
-        
-        # 强制解锁并进入 OFFBOARD
-        while not rospy.is_shutdown() and (self.current_state.mode != "OFFBOARD" or not self.current_state.armed):
-            self.set_mode_client(custom_mode="OFFBOARD")
-            self.arming_client(True)
-            self.pos_pub.publish(takeoff_pose)
+        # 2. 解锁起飞
+        rospy.loginfo("请求解锁并进入 OFFBOARD 模式...")
+        while not rospy.is_shutdown():
+            if self.current_state.mode != "OFFBOARD":
+                self.cmd_pub.publish("OFFBOARD")
+            if not self.current_state.armed:
+                self.cmd_pub.publish("ARM")
+            if self.current_pose.pose.position.z > (self.target_alt - 0.3):
+                rospy.loginfo(">>> 起飞完成，已平稳悬停")
+                break
+            takeoff_p = Pose()
+            takeoff_p.position.z = self.target_alt
+            self.pos_pub.publish(takeoff_p)
             self.rate.sleep()
-            if self.current_pose.pose.position.z > (self.target_alt - 0.2): break
 
-        # --- 大循环开始 ---
+        # 3. 主循环
         while not rospy.is_shutdown():
             print("\n" + "="*40)
-            print("可用特技模式: ")
-            print("1: 直线 | 2: 正方形 | 3: S形 | 4: 螺旋 | q: 退出并着陆")
-            mode = input("请选择要执行的动作编号: ")
-            print("="*40)
-
+            print(f"【数据集采集模式】当前高度: {self.current_pose.pose.position.z:.2f}m")
+            print("1:直线 | 2:正方形 | 3:S形 | 4:螺旋 | q:着陆")
+            mode = input("请输入采集任务编号: ")
+            
             if mode.lower() == 'q':
-                rospy.loginfo("执行着陆指令...")
-                self.set_mode_client(custom_mode="AUTO.LAND")
+                self.cmd_pub.publish("AUTO.LAND")
                 break
+            if mode not in ['1', '2', '3', '4']: continue
 
-            if mode not in ['1', '2', '3', '4']:
-                print("输入无效，请重新选择。")
-                continue
+            # 准备 CSV 文件
+            filename = f"Task_{mode}_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+            file_full_path = os.path.join(self.save_path, filename)
+            
+            self.is_collecting = True
+            rospy.loginfo(f"开始采集任务 {mode}，数据将保存至: {filename}")
 
-            # 开始采集
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            data_dir = os.path.expanduser("~/flight_dataset")
-            if not os.path.exists(data_dir): os.makedirs(data_dir)
-            file_path = os.path.join(data_dir, f"Mode{mode}_{timestamp}.csv")
-            
-            rospy.loginfo(f"开始执行模式 {mode}，数据保存至: {os.path.basename(file_path)}")
-            
-            with open(file_path, 'w', newline='') as f:
+            with open(file_full_path, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['timestamp', 'label', 'x', 'y', 'z', 'roll', 'pitch', 'yaw', 'vx', 'vy', 'vz', 'wz'])
-                
+                # 写入表头：时间戳, 标签, 状态(x,y,z,r,p,y), 动作(vx,vy,vz,wz)
+                writer.writerow(['timestamp', 'label', 'pos_x', 'pos_y', 'pos_z', 
+                                 'roll', 'pitch', 'yaw', 'vel_x', 'vel_y', 'vel_z', 'ang_z'])
+
                 start_time = rospy.get_time()
+                self.prev_z_err = 0
+                
                 try:
-                    while not rospy.is_shutdown():
+                    while not rospy.is_shutdown() and (rospy.get_time() - start_time < 30):
                         t = rospy.get_time() - start_time
                         cmd = Twist()
                         
-                        # 高度维持 P 控制
-                        alt_err = self.target_alt - self.current_pose.pose.position.z
-                        cmd.linear.z = 0.8 * alt_err 
+                        # --- 1. 计算特技控制逻辑 (动作生成) ---
+                        curr_z = self.current_pose.pose.position.z
+                        alt_err = self.target_alt - curr_z
+                        cmd.linear.z = 2.0 * alt_err + 0.3 * (alt_err - self.prev_z_err)
+                        self.prev_z_err = alt_err
 
-                        # 动作逻辑
-                        if mode == '1': # 直线
-                            cmd.linear.x = 2.0
-                        elif mode == '2': # 正方形
+                        if mode == '1': cmd.linear.x = 2.0
+                        elif mode == '2':
                             if t % 16 < 4: cmd.linear.x = 1.5
                             elif t % 16 < 8: cmd.linear.y = 1.5
                             elif t % 16 < 12: cmd.linear.x = -1.5
                             else: cmd.linear.y = -1.5
-                        elif mode == '3': # S形
-                            cmd.linear.x = 1.5
-                            cmd.linear.y = 2.0 * math.sin(0.8 * t)
-                        elif mode == '4': # 螺旋
-                            r, om = 2.5, 0.7
+                        elif mode == '3':
+                            cmd.linear.x = 1.5; cmd.linear.y = 2.0 * math.sin(0.8 * t)
+                        elif mode == '4':
+                            r, om = 2.0, 0.6
                             cmd.linear.x = -r * om * math.sin(om * t)
                             cmd.linear.y = r * om * math.cos(om * t)
-                            cmd.linear.z += 0.2
+                            cmd.linear.z += 0.3 # 螺旋上升
 
+                        # --- 2. 执行动作 ---
                         self.vel_pub.publish(cmd)
 
-                        # 记录状态
-                        q = self.current_pose.pose.orientation
-                        r, p, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
-                        writer.writerow([rospy.get_time(), mode, 
-                                         self.current_pose.pose.position.x, self.current_pose.pose.position.y, self.current_pose.pose.position.z,
-                                         r, p, yaw, cmd.linear.x, cmd.linear.y, cmd.linear.z, cmd.angular.z])
-                        
+                        # --- 3. 获取并解析状态空间 ---
+                        pos = self.current_pose.pose.position
+                        ori = self.current_pose.pose.orientation
+                        # 四元数转欧拉角 (弧度)
+                        (r, p, y) = euler_from_quaternion([ori.x, ori.y, ori.z, ori.w])
+
+                        # --- 4. 写入数据 ---
+                        writer.writerow([
+                            rospy.get_time(), mode, 
+                            pos.x, pos.y, pos.z,           # 位置状态
+                            r, p, y,                       # 姿态状态
+                            cmd.linear.x, cmd.linear.y,    # 动作空间
+                            cmd.linear.z, cmd.angular.z
+                        ])
+
                         self.rate.sleep()
-                        if t > 30: break # 每个动作执行 30 秒
                 except KeyboardInterrupt:
-                    rospy.loginfo("手动中断当前动作。")
+                    pass
             
-            # 动作结束，飞回原点
-            self.return_to_origin()
+            self.is_collecting = False
+            rospy.loginfo(f">>> 任务 {mode} 采集完成。")
 
 if __name__ == '__main__':
     try:
-        AerobaticAutoLoop().run()
+        GPSAerobaticCollectorV7().run()
     except rospy.ROSInterruptException:
         pass
