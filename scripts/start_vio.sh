@@ -32,7 +32,7 @@ PX4_PACKAGES="$FIRMWARE_DIR:$FIRMWARE_DIR/Tools/sitl_gazebo"
 gnome-terminal --window --title="PX4 SITL" -- bash -c "\
 source ~/.bashrc; \
 export ROS_PACKAGE_PATH=\$ROS_PACKAGE_PATH:$PX4_PACKAGES; \
-roslaunch px4 indoor5.launch; \
+roslaunch px4 RL_train.launch; \
 exec bash"
 
 # 等待仿真环境完全加载
