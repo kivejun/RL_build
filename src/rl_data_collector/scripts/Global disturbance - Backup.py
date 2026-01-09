@@ -8,13 +8,12 @@ import os
 import time
 import random
 import threading
-import numpy as np
 from geometry_msgs.msg import Twist, PoseStamped, Pose
 from mavros_msgs.msg import State
 from std_msgs.msg import String
 from tf.transformations import euler_from_quaternion
 
-class GPSAerobaticCollectorV11:
+class GPSAerobaticCollectorV10:
     def __init__(self):
         rospy.init_node('expert_collector_node')
         
@@ -24,31 +23,28 @@ class GPSAerobaticCollectorV11:
         self.target_alt = 2.3
         self.is_collecting = False 
 
-        # --- 强扰动与纠偏增益配置 ---
-        self.perturb_chance = 0.03
-        self.perturb_magnitude = 3.5
-        self.perturb_duration = 0.5
-        self.perturb_cooldown = 4.0
-        self.last_perturb_time = 0      # <--- 修复：添加漏掉的初始化变量
-        self.Kp_pos = 1.8
+        # --- 强扰动参数配置 ---
+        self.perturb_chance = 0.02      # 触发概率提升 (3%)
+        self.perturb_duration = 0.5     # 扰动持续时间
+        self.perturb_magnitude = 3.5    # 扰动最大强度 (m/s)，显著增强
+        self.perturb_cooldown = 3.5     # 冷却时间缩短
+        self.last_perturb_time = 0
 
-        # --- 状态变量 ---
-        self.current_state = State()
-        self.current_pose = PoseStamped()
-        
-        # ROS 通讯
+        # --- 闭环纠偏增益 ---
+        self.Kp_pos = 1.8               # 增强纠偏力度，保证能拉回来
+
+        # 发布与订阅
         self.pos_pub = rospy.Publisher(self.xtdrone_ns + "/cmd_pose_enu", Pose, queue_size=10)
         self.vel_pub = rospy.Publisher(self.xtdrone_ns + "/cmd_vel_flu", Twist, queue_size=10)
         self.cmd_pub = rospy.Publisher(self.xtdrone_ns + "/cmd", String, queue_size=10)
-        
+        self.current_state = State()
+        self.current_pose = PoseStamped()
         rospy.Subscriber(self.mavros_ns + "/mavros/state", State, self.state_cb)
         rospy.Subscriber(self.mavros_ns + "/mavros/local_position/pose", PoseStamped, self.pose_cb)
         
         self.rate = rospy.Rate(30)
         self.save_path = os.path.expanduser("~/flight_dataset")
         if not os.path.exists(self.save_path): os.makedirs(self.save_path)
-        
-        # 后台心跳保持起飞后的悬停
         threading.Thread(target=self.maintain_hover_audit, daemon=True).start()
 
     def state_cb(self, msg): self.current_state = msg
@@ -64,92 +60,67 @@ class GPSAerobaticCollectorV11:
             hover_rate.sleep()
 
     def run(self):
-        # 1. 等待连接与解锁起飞 (完全参考 V7 成功逻辑)
-        while not rospy.is_shutdown() and not self.current_state.connected:
-            self.rate.sleep()
-        
-        rospy.loginfo("请求解锁并起飞...")
+        # 起飞逻辑 (保持 V7 成功版本)
+        while not rospy.is_shutdown() and not self.current_state.connected: self.rate.sleep()
         while not rospy.is_shutdown():
-            if self.current_state.mode != "OFFBOARD":
-                self.cmd_pub.publish("OFFBOARD")
-            if not self.current_state.armed:
-                self.cmd_pub.publish("ARM")
-            if self.current_pose.pose.position.z > (self.target_alt - 0.3):
-                rospy.loginfo(">>> 已到达起飞高度")
-                break
+            if self.current_state.mode != "OFFBOARD": self.cmd_pub.publish("OFFBOARD")
+            if not self.current_state.armed: self.cmd_pub.publish("ARM")
+            if self.current_pose.pose.position.z > (self.target_alt - 0.3): break
             p = Pose(); p.position.z = self.target_alt
-            self.pos_pub.publish(p)
-            self.rate.sleep()
+            self.pos_pub.publish(p); self.rate.sleep()
 
-        # 2. 任务选择与随机化采集
         while not rospy.is_shutdown():
             print("\n" + "="*40)
-            print("【全随机化采集 V11】1:直线 | 2:正方形 | 3:S形 | q:着陆")
-            mode = input("输入任务编号: ")
-            if mode.lower() == 'q':
-                self.cmd_pub.publish("AUTO.LAND")
-                break
-            if mode not in ['1', '2', '3']: continue
-
-            # --- 随机化本次任务参数 (重要：解决过拟合) ---
-            rand_yaw = random.uniform(0, 2 * math.pi)  # 随机初始航向
-            rand_scale = random.uniform(0.7, 1.4)     # 随机轨迹尺度
-            start_pos = self.current_pose.pose.position
-            origin_x, origin_y = start_pos.x, start_pos.y
+            print("【全向扰动采集 V10】1:直线 | 2:正方形 | 3:S形 | q:着陆")
+            mode = input("编号: ")
+            if mode.lower() == 'q': self.cmd_pub.publish("AUTO.LAND"); break
             
-            filename = f"Task_{mode}_DR_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+            filename = f"Task_{mode}_OmniPerturb_{time.strftime('%H%M%S')}.csv"
             file_full_path = os.path.join(self.save_path, filename)
             self.is_collecting = True
-            rospy.loginfo(f"开始任务: 航向偏置={math.degrees(rand_yaw):.1f}°, 尺度={rand_scale:.2f}")
 
             with open(file_full_path, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['timestamp', 'pos_x', 'pos_y', 'pos_z', 'roll', 'pitch', 'yaw', 'vel_x', 'vel_y', 'vel_z', 'is_p'])
+                writer.writerow(['timestamp', 'pos_x', 'pos_y', 'pos_z', 'roll', 'pitch', 'yaw', 'vel_x', 'vel_y', 'vel_z', 'is_perturbed'])
                 
                 start_time = rospy.get_time()
                 perturb_end_time = 0
-                noise_vec = [0, 0, 0]
+                noise_vec = [0.0, 0.0, 0.0]
 
-                while not rospy.is_shutdown() and (rospy.get_time() - start_time < 35):
+                while not rospy.is_shutdown() and (rospy.get_time() - start_time < 40):
                     now = rospy.get_time()
                     t = now - start_time
                     
-                    # A. 局部参考系下的坐标 (Local frame)
-                    lx, ly, lz = 0, 0, self.target_alt
-                    if mode == '1': 
-                        lx = 1.5 * rand_scale * t
+                    # 1. 理想轨迹计算 (保持不变)
+                    ref_x, ref_y, ref_z = 0, 0, self.target_alt
+                    if mode == '1': ref_x = 1.5 * t
                     elif mode == '2':
-                        s = 6.0 * rand_scale; p = 16.0
-                        if t%p<4: lx=1.5*rand_scale*(t%4); ly=0
-                        elif t%p<8: lx=s; ly=1.5*rand_scale*(t%4)
-                        elif t%p<12: lx=s-1.5*rand_scale*(t%4); ly=s
-                        else: lx=0; ly=s-1.5*rand_scale*(t%4)
-                    elif mode == '3':
-                        lx = 1.2 * rand_scale * t; ly = 2.2 * rand_scale * math.sin(0.6 * t)
+                        s, p = 6.0, 16.0
+                        if t%p<4: ref_x=1.5*(t%4); ref_y=0
+                        elif t%p<8: ref_x=s; ref_y=1.5*(t%4)
+                        elif t%p<12: ref_x=s-1.5*(t%4); ref_y=s
+                        else: ref_x=0; ref_y=s-1.5*(t%4)
+                    elif mode == '3': ref_x = 1.2 * t; ref_y = 2.5 * math.sin(0.6 * t)
 
-                    # B. 坐标旋转变换 (Local -> Global ENU)
-                    ref_x = lx * math.cos(rand_yaw) - ly * math.sin(rand_yaw) + origin_x
-                    ref_y = lx * math.sin(rand_yaw) + ly * math.cos(rand_yaw) + origin_y
-                    ref_z = lz
-
-                    # C. 闭环纠偏计算
+                    # 2. 闭环专家指令 (P控制)
                     cp = self.current_pose.pose.position
                     cmd_expert = Twist()
                     cmd_expert.linear.x = self.Kp_pos * (ref_x - cp.x)
                     cmd_expert.linear.y = self.Kp_pos * (ref_y - cp.y)
                     cmd_expert.linear.z = self.Kp_pos * (ref_z - cp.z)
 
-                    # D. 全向扰动注入逻辑
+                    # 3. 全向随机扰动逻辑
                     is_p = False
                     if now > perturb_end_time and (now - self.last_perturb_time) > self.perturb_cooldown:
                         if random.random() < self.perturb_chance:
                             is_p = True
                             perturb_end_time = now + self.perturb_duration
                             self.last_perturb_time = perturb_end_time
+                            # 生成三维球形空间内的随机扰动向量
                             noise_vec = [random.uniform(-1, 1) * self.perturb_magnitude for _ in range(3)]
-                            rospy.logwarn(">>> 注入强扰动！")
+                            rospy.logwarn(f">>> 注入全向扰动: X:{noise_vec[0]:.1f} Y:{noise_vec[1]:.1f} Z:{noise_vec[2]:.1f}")
 
-                    # E. 最终动作合并
+                    # 4. 执行动作
                     cmd_final = Twist()
                     if now < perturb_end_time:
                         is_p = True
@@ -162,19 +133,17 @@ class GPSAerobaticCollectorV11:
 
                     self.vel_pub.publish(cmd_final)
 
-                    # F. 数据落地
+                    # 5. 记录数据
                     ori = self.current_pose.pose.orientation
-                    (r, p, y_angle) = euler_from_quaternion([ori.x, ori.y, ori.z, ori.w])
-                    writer.writerow([now, cp.x, cp.y, cp.z, r, p, y_angle, 
+                    (r, p, y) = euler_from_quaternion([ori.x, ori.y, ori.z, ori.w])
+                    writer.writerow([now, cp.x, cp.y, cp.z, r, p, y, 
                                      cmd_expert.linear.x, cmd_expert.linear.y, cmd_expert.linear.z, 
                                      1 if is_p else 0])
                     self.rate.sleep()
             
             self.is_collecting = False
-            rospy.loginfo("采集序列完成，返回悬停。")
+            rospy.loginfo("采集结束。")
 
 if __name__ == '__main__':
-    try:
-        GPSAerobaticCollectorV11().run()
-    except rospy.ROSInterruptException:
-        pass
+    try: GPSAerobaticCollectorV10().run()
+    except rospy.ROSInterruptException: pass
